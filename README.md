@@ -7,7 +7,8 @@
 - **🎙️ 语音识别** — 浏览器实时录音识别 / 上传音频文件识别
 - **📝 识别记录** — 自动保存识别历史，支持导出文本
 - **💬 AI 对话** — 本地大模型对话，支持语音输入到对话
-- **🔒 完全离线** — ASR 使用 SenseVoice-Small ONNX，LLM 使用本地 Ollama
+- **🔊 语音合成** — AI 回复自动朗读，多发音人（Kokoro TTS），完整语音对话闭环
+- **🔒 完全离线** — ASR 用 SenseVoice ONNX，TTS 用 Kokoro，LLM 用本地 Ollama
 
 ## 支持的语种
 
@@ -91,17 +92,32 @@ ollama list
 ├── server.py           # FastAPI 后端
 ├── asr_engine.py       # SenseVoice ONNX 语音识别引擎
 ├── llm_engine.py       # Ollama LLM 对话引擎
+├── tts_engine.py       # Kokoro TTS 语音合成引擎
 ├── db.py               # SQLite 存储层
 ├── frontend.html       # 单页 Web 前端
 ├── requirements.txt    # Python 依赖
 ├── 启动.bat            # 启动脚本 (带日志窗口)
 ├── 启动-无黑窗.bat     # 静默启动脚本
 └── models/
-    └── Sensevoice-Small-ONNX/
-        ├── SenseVoice-Encoder.fp16.onnx
-        ├── SenseVoice-CTC.fp16.onnx
-        └── tokenizer.bpe.model
+    ├── Sensevoice-Small-ONNX/   # ASR 模型
+    │   ├── SenseVoice-Encoder.fp16.onnx
+    │   ├── SenseVoice-CTC.fp16.onnx
+    │   └── tokenizer.bpe.model
+    └── KokoroTTS/               # TTS 模型
+        ├── kokoro-v1_0.pth
+        ├── config.json
+        └── voices/*.pt          # 多发音人 (中/英)
 ```
+
+## 语音合成 (TTS)
+
+- 模型：Kokoro v1.0（24kHz，多语言多发音人）
+- 中文 G2P：misaki[zh]（jieba）；英文 G2P：espeak-ng
+- 发音人：中文 8 个（小晓/小妮/小北/小艺/云希/云健/云扬/云夏），英文若干
+- 对话页顶栏可选发音人、开关「自动朗读」；每条 AI 回复也有 🔊 手动朗读按钮
+
+> 首次英文合成需 spaCy 英文小模型 `en_core_web_sm`（纯中文对话不需要）。
+> 离线安装：下载 `en_core_web_sm-3.8.0-py3-none-any.whl` 后 `pip install`。
 
 ## 配置
 

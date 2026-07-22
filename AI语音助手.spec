@@ -13,18 +13,25 @@ binaries = []
 hiddenimports = []
 
 # 收集需要携带二进制/数据的第三方库
-for pkg in ["onnxruntime", "kaldi_native_fbank", "sentencepiece", "soxr", "webview"]:
-    d, b, h = collect_all(pkg)
-    datas += d
-    binaries += b
-    hiddenimports += h
+for pkg in ["onnxruntime", "kaldi_native_fbank", "sentencepiece", "soxr", "webview",
+            "kokoro", "misaki", "espeakng_loader", "torch", "spacy",
+            "en_core_web_sm", "jieba", "phonemizer", "curated_tokenizers",
+            "curated_transformers", "transformers", "thinc", "blis",
+            "language_tags", "csvw", "segments"]:
+    try:
+        d, b, h = collect_all(pkg)
+        datas += d
+        binaries += b
+        hiddenimports += h
+    except Exception:
+        pass
 
 # uvicorn / fastapi 动态导入
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += [
     "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on",
-    "asr_engine", "llm_engine", "db", "server", "paths",
+    "asr_engine", "llm_engine", "tts_engine", "db", "server", "paths",
 ]
 
 

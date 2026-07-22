@@ -21,6 +21,7 @@ import uvicorn
 
 from asr_engine import get_engine, ASREngine
 from llm_engine import get_engine as get_llm, LLMEngine
+from tts_engine import get_engine as get_tts, VOICES as TTS_VOICES
 from db import init_db, add_transcript, list_transcripts, delete_transcript, clear_transcripts
 from db import create_conversation, list_conversations, rename_conversation, delete_conversation
 from db import add_message, get_messages
@@ -39,6 +40,23 @@ def startup():
     get_engine()
     # 预加载 LLM 引擎
     get_llm()
+    # TTS 引擎较重 (torch+spacy), 后台线程预热, 不阻塞启动
+    import threading
+    threading.Thread(target=_warmup_tts, daemon=True).start()
+
+
+def _warmup_tts():
+    try:
+        get_tts()
+        print("[启动] TTS 引擎就绪")
+    except Exception as e:
+        import traceback
+        try:
+            with open(os.path.join(APP_DIR, "tts_error.log"), "a", encoding="utf-8") as f:
+                f.write("[warmup] " + traceback.format_exc() + "\n")
+        except Exception:
+            pass
+        print(f"[启动] TTS 引擎预热失败: {e}")
 
 
 # ---------- ASR 接口 ----------
@@ -118,6 +136,39 @@ def api_clear_transcripts():
 @app.get("/api/llm/models")
 def api_list_models():
     return {"models": get_llm().list_models()}
+
+
+# ---------- TTS 接口 ----------
+@app.get("/api/tts/voices")
+def api_tts_voices():
+    return {"voices": [{"id": k, "name": v} for k, v in TTS_VOICES.items()]}
+
+
+@app.post("/api/tts")
+async def api_tts(body: dict = Body(...)):
+    """文本合成语音, 返回 WAV 音频"""
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "文本不能为空")
+    voice = body.get("voice", "zf_xiaoxiao")
+    try:
+        speed = float(body.get("speed", 1.0))
+    except (TypeError, ValueError):
+        speed = 1.0
+    try:
+        wav = get_tts().synthesize_wav(text, voice=voice, speed=speed)
+        from fastapi.responses import Response
+        return Response(content=wav, media_type="audio/wav")
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            with open(os.path.join(APP_DIR, "tts_error.log"), "a", encoding="utf-8") as f:
+                f.write(tb + "\n")
+        except Exception:
+            pass
+        raise HTTPException(500, f"语音合成失败: {e}")
+
 
 
 @app.post("/api/chat/stream")

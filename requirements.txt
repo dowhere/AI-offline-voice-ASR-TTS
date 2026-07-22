@@ -8,3 +8,11 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 requests>=2.32
 pywebview>=6.0
+# TTS (Kokoro)
+torch>=2.1
+kokoro>=0.9
+misaki[zh]>=0.9
+espeakng-loader>=0.2
+# 英文 G2P 需要 spaCy 英文小模型 (离线): 首次运行前执行
+#   python -m spacy download en_core_web_sm
+# 或手动下载 en_core_web_sm-3.8.0-py3-none-any.whl 后 pip install
