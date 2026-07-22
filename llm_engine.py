@@ -1,87 +1,136 @@
 """
-本地 Ollama LLM 对话引擎
-支持流式 SSE 输出, 支持对话历史管理
+LLM 对话引擎 — 支持多 provider
+- ollama: 本地 Ollama (http://127.0.0.1:11434)
+- openai: 任意 OpenAI 兼容接口 (URL + api-key + model)
+provider 配置存于 SQLite (db.llm_providers), 对话时按需选用。
 """
 import json
 import requests
-import time
 
-OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_BASE = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:8b"
 
 
+# ---------- provider 探测 / 列模型 ----------
+def list_models_for(provider):
+    """列出某 provider 可用模型名"""
+    kind = provider.get("kind", "ollama")
+    base = provider.get("base_url", "").rstrip("/")
+    key = provider.get("api_key", "")
+    if kind == "ollama":
+        r = requests.get(f"{base}/api/tags", timeout=5)
+        return [m["name"] for m in r.json().get("models", [])]
+    else:  # openai 兼容
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        r = requests.get(f"{base}/models", headers=headers, timeout=8)
+        data = r.json().get("data", [])
+        return [m["id"] for m in data]
+
+
+def ping(provider):
+    """测试连通性, 返回 (ok, msg)"""
+    try:
+        models = list_models_for(provider)
+        return True, f"连接成功，{len(models)} 个模型"
+    except Exception as e:
+        return False, f"连接失败: {e}"
+
+
+# ---------- 对话 ----------
+def _messages_body(model, messages, stream, **opts):
+    return {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+
+
+def chat_stream(provider, model, messages):
+    """统一流式对话入口, yield {'text':str,'done':bool}"""
+    kind = provider.get("kind", "ollama")
+    base = provider.get("base_url", "").rstrip("/")
+    key = provider.get("api_key", "")
+
+    if kind == "ollama":
+        body = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {"num_predict": 2048, "temperature": 0.7},
+        }
+        resp = requests.post(f"{base}/api/chat", json=body, stream=True, timeout=120)
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            data = json.loads(line)
+            yield {"text": data.get("message", {}).get("content", ""),
+                   "done": data.get("done", False)}
+            if data.get("done"):
+                break
+    else:  # openai 兼容 (SSE)
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        body = {"model": model, "messages": messages, "stream": True,
+                "temperature": 0.7, "max_tokens": 2048}
+        resp = requests.post(f"{base}/chat/completions", json=body,
+                             headers=headers, stream=True, timeout=120)
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            s = line.decode("utf-8") if isinstance(line, bytes) else line
+            if s.startswith("data:"):
+                s = s[5:].strip()
+            if s == "[DONE]":
+                yield {"text": "", "done": True}
+                break
+            try:
+                data = json.loads(s)
+            except Exception:
+                continue
+            delta = data.get("choices", [{}])[0].get("delta", {})
+            piece = delta.get("content", "") or ""
+            finish = data.get("choices", [{}])[0].get("finish_reason")
+            yield {"text": piece, "done": bool(finish)}
+            if finish:
+                break
+
+
+# ---------- 兼容旧接口 (启动状态探测用) ----------
 class LLMEngine:
+    """薄封装: 默认连本地 Ollama, 供启动状态检测复用"""
     def __init__(self, base_url=OLLAMA_BASE, model=DEFAULT_MODEL):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        # 验证可用性
         self._check()
 
     def _check(self):
         try:
             r = requests.get(f"{self.base_url}/api/tags", timeout=3)
-            models = r.json().get("models", [])
-            names = [m["name"] for m in models]
+            names = [m["name"] for m in r.json().get("models", [])]
             if self.model not in names:
                 closest = [n for n in names if self.model.split(":")[0] in n]
-                if closest:
-                    self.model = closest[0]
-                    print(f"[LLM] 切换模型: {closest[0]}")
-                else:
-                    print(f"[LLM] 警告: {self.model} 未找到, 可用模型: {names}")
+                self.model = closest[0] if closest else (names[0] if names else self.model)
+                print(f"[LLM] 使用模型: {self.model}")
             else:
                 print(f"[LLM] 已连接, 使用模型: {self.model}")
         except Exception as e:
-            print(f"[LLM] 警告: 无法连接 Ollama ({e}), 请确保 Ollama 在运行")
-            print(f"       启动: ollama serve")
+            print(f"[LLM] 警告: 无法连接 Ollama ({e})")
 
     def list_models(self):
         r = requests.get(f"{self.base_url}/api/tags", timeout=3)
         return [m["name"] for m in r.json().get("models", [])]
 
     def chat(self, messages, stream=False, **kwargs):
-        """
-        messages: [{"role":"user"/"assistant"/"system", "content":"..."}]
-        stream=True 返回生成器, 每次 yield {"text": str, "done": bool}
-        """
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "stream": stream,
-            "options": {"num_predict": 2048, "temperature": 0.7, **kwargs},
-        }
-        resp = requests.post(
-            f"{self.base_url}/api/chat",
-            json=body,
-            stream=stream,
-            timeout=60,
-        )
+        provider = {"kind": "ollama", "base_url": self.base_url, "api_key": ""}
         if stream:
-            return self._stream(resp)
-        else:
-            return resp.json()["message"]["content"]
-
-    @staticmethod
-    def _stream(resp):
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            data = json.loads(line)
-            yield {"text": data.get("message", {}).get("content", ""), "done": data.get("done", False)}
-            if data.get("done"):
-                break
-
-    def chat_with_history(self, history, user_msg, system_prompt=None):
-        """快捷方法: 追加用户消息, 流式回复, 返回完整回复并更新 history"""
-        if system_prompt:
-            history = [m for m in history if m["role"] != "system"]
-            history.insert(0, {"role": "system", "content": system_prompt})
-        history.append({"role": "user", "content": user_msg})
+            return chat_stream(provider, self.model, messages)
         full = ""
-        for chunk in self.chat(history, stream=True):
-            full += chunk["text"]
-        history.append({"role": "assistant", "content": full})
-        return full, history
+        for c in chat_stream(provider, self.model, messages):
+            full += c["text"]
+        return full
 
 
 _engine = None
@@ -97,5 +146,3 @@ def get_engine():
 if __name__ == "__main__":
     eng = LLMEngine()
     print("可用模型:", eng.list_models())
-    resp, _ = eng.chat_with_history([], "用一句话介绍自己")
-    print("回复:", resp)

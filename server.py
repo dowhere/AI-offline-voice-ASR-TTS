@@ -20,48 +20,108 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from asr_engine import get_engine, ASREngine
-from llm_engine import get_engine as get_llm, LLMEngine
+from llm_engine import get_engine as get_llm, LLMEngine, chat_stream, list_models_for, ping
 from tts_engine import get_engine as get_tts, VOICES as TTS_VOICES
 from db import init_db, add_transcript, list_transcripts, delete_transcript, clear_transcripts
 from db import create_conversation, list_conversations, rename_conversation, delete_conversation
 from db import add_message, get_messages
+from db import (list_providers, add_provider, update_provider, delete_provider,
+                set_default_provider, get_default_provider, get_provider)
 from paths import APP_DIR, resource_path
 
 _DIR = APP_DIR
 
 app = FastAPI(title="AI 离线语音输入 & 对话", version="1.0.0")
 
-# ---------- 启动时 ----------
-@app.on_event("startup")
-def startup():
-    init_db()
-    print("[启动] 数据库初始化完成")
-    # 预加载 ASR 引擎
-    get_engine()
-    # 预加载 LLM 引擎
-    get_llm()
-    # TTS 引擎较重 (torch+spacy), 后台线程预热, 不阻塞启动
-    import threading
-    threading.Thread(target=_warmup_tts, daemon=True).start()
+# ---------- 引擎加载状态 ----------
+ENGINE_STATUS = {
+    "asr": "loading",   # loading | ready | error
+    "llm": "loading",
+    "tts": "loading",
+    "asr_msg": "",
+    "llm_msg": "",
+    "tts_msg": "",
+}
 
 
-def _warmup_tts():
+def _load_asr():
+    try:
+        get_engine()
+        ENGINE_STATUS["asr"] = "ready"
+        print("[启动] ASR 引擎就绪")
+    except Exception as e:
+        ENGINE_STATUS["asr"] = "error"
+        ENGINE_STATUS["asr_msg"] = str(e)
+        print(f"[启动] ASR 引擎加载失败: {e}")
+
+
+def _load_llm():
+    try:
+        eng = get_llm()
+        ENGINE_STATUS["llm"] = "ready"
+        ENGINE_STATUS["llm_msg"] = getattr(eng, "model", "")
+        print("[启动] LLM 引擎就绪")
+    except Exception as e:
+        ENGINE_STATUS["llm"] = "error"
+        ENGINE_STATUS["llm_msg"] = str(e)
+        print(f"[启动] LLM 引擎加载失败: {e}")
+
+
+def _load_tts():
     try:
         get_tts()
+        ENGINE_STATUS["tts"] = "ready"
         print("[启动] TTS 引擎就绪")
     except Exception as e:
+        ENGINE_STATUS["tts"] = "error"
+        ENGINE_STATUS["tts_msg"] = str(e)
         import traceback
         try:
             with open(os.path.join(APP_DIR, "tts_error.log"), "a", encoding="utf-8") as f:
                 f.write("[warmup] " + traceback.format_exc() + "\n")
         except Exception:
             pass
-        print(f"[启动] TTS 引擎预热失败: {e}")
+        print(f"[启动] TTS 引擎加载失败: {e}")
+
+
+# ---------- 启动时 ----------
+@app.on_event("startup")
+def startup():
+    init_db()
+    print("[启动] 数据库初始化完成，界面可立即使用")
+
+
+_engines_started = False
+
+
+def _start_engines():
+    global _engines_started
+    if _engines_started:
+        return
+    _engines_started = True
+    print("[启动] 界面已就绪，开始后台加载模型引擎...")
+    import threading
+    for fn in (_load_asr, _load_llm, _load_tts):
+        threading.Thread(target=fn, daemon=True).start()
+
+
+@app.post("/api/engines/start")
+def api_start_engines():
+    """由 GUI 在窗口显示后调用, 触发模型加载 (界面未打开前不加载)"""
+    _start_engines()
+    return {"ok": True}
+
+
+@app.get("/api/status")
+def api_status():
+    return ENGINE_STATUS
 
 
 # ---------- ASR 接口 ----------
 @app.post("/api/asr/upload")
 async def asr_upload(file: UploadFile = File(...), language: str = Form("auto")):
+    if ENGINE_STATUS["asr"] != "ready":
+        raise HTTPException(503, "语音识别引擎正在加载中，请稍候…")
     content = await file.read()
     if not content:
         raise HTTPException(400, "空文件")
@@ -99,6 +159,8 @@ async def asr_upload(file: UploadFile = File(...), language: str = Form("auto"))
 @app.post("/api/asr/record")
 async def asr_record(request: Request, sample_rate: int = 16000, language: str = "auto"):
     """接收浏览器录音的 PCM16 原始字节流 (application/octet-stream)"""
+    if ENGINE_STATUS["asr"] != "ready":
+        raise HTTPException(503, "语音识别引擎正在加载中，请稍候…")
     data = await request.body()
     if not data:
         raise HTTPException(400, "空数据")
@@ -147,6 +209,8 @@ def api_tts_voices():
 @app.post("/api/tts")
 async def api_tts(body: dict = Body(...)):
     """文本合成语音, 返回 WAV 音频"""
+    if ENGINE_STATUS["tts"] != "ready":
+        raise HTTPException(503, "语音合成引擎正在加载中，请稍候…")
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "文本不能为空")
@@ -175,8 +239,7 @@ async def api_tts(body: dict = Body(...)):
 async def api_chat_stream(body: dict = Body(...)):
     """
     流式 SSE 对话
-    body: { "conversation_id": int|None, "message": str, "system_prompt": str|None }
-    返回 SSE: data: {"text": "...", "done": false, "conversation_id": 1}
+    body: { conversation_id, message, system_prompt, provider_id, model }
     """
     msg = body.get("message", "").strip()
     if not msg:
@@ -184,6 +247,15 @@ async def api_chat_stream(body: dict = Body(...)):
 
     system_prompt = body.get("system_prompt")
     cid = body.get("conversation_id")
+
+    # 选定 provider + model
+    pid = body.get("provider_id")
+    provider = get_provider(pid) if pid else get_default_provider()
+    if not provider:
+        raise HTTPException(400, "未配置任何大模型，请先在「模型管理」中添加")
+    model = body.get("model") or provider.get("model") or ""
+    if not model:
+        raise HTTPException(400, "请先选择一个模型")
 
     # 获取或创建会话
     if cid is None:
@@ -199,24 +271,106 @@ async def api_chat_stream(body: dict = Body(...)):
         history.append({"role": "system", "content": system_prompt})
     for m in get_messages(cid):
         history.append({"role": m["role"], "content": m["content"]})
-
     history.append({"role": "user", "content": msg})
 
     async def generate():
         full = ""
-        for chunk in get_llm().chat(history, stream=True):
-            full += chunk["text"]
-            yield f"data: {json.dumps({'text': chunk['text'], 'done': chunk['done'], 'conversation_id': cid}, ensure_ascii=False)}\n\n"
-            if chunk["done"]:
-                # 保存到数据库
-                add_message(cid, "user", msg)
-                add_message(cid, "assistant", full)
+        try:
+            for chunk in chat_stream(provider, model, history):
+                full += chunk["text"]
+                yield f"data: {json.dumps({'text': chunk['text'], 'done': chunk['done'], 'conversation_id': cid}, ensure_ascii=False)}\n\n"
+                if chunk["done"]:
+                    add_message(cid, "user", msg)
+                    add_message(cid, "assistant", full)
+        except Exception as e:
+            yield f"data: {json.dumps({'text': f'[对话出错: {e}]', 'done': True, 'conversation_id': cid}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+# ---------- 模型管理 (Provider) ----------
+@app.get("/api/providers")
+def api_list_providers():
+    # 不回传 api_key 明文, 只标记是否已配置
+    out = []
+    for p in list_providers():
+        p = dict(p)
+        p["has_key"] = bool(p.get("api_key"))
+        p.pop("api_key", None)
+        out.append(p)
+    return out
+
+
+@app.post("/api/providers")
+async def api_add_provider(body: dict = Body(...)):
+    name = (body.get("name") or "").strip()
+    kind = body.get("kind", "openai")
+    base_url = (body.get("base_url") or "").strip()
+    if not name or not base_url:
+        raise HTTPException(400, "名称和地址不能为空")
+    pid = add_provider(name, kind, base_url,
+                       api_key=body.get("api_key", ""),
+                       model=body.get("model", ""),
+                       is_default=1 if body.get("is_default") else 0)
+    return {"id": pid}
+
+
+@app.patch("/api/providers/{pid}")
+async def api_update_provider(pid: int, body: dict = Body(...)):
+    update_provider(pid, **body)
+    return {"ok": True}
+
+
+@app.delete("/api/providers/{pid}")
+def api_delete_provider(pid: int):
+    delete_provider(pid)
+    return {"ok": True}
+
+
+@app.post("/api/providers/{pid}/default")
+def api_set_default(pid: int):
+    set_default_provider(pid)
+    return {"ok": True}
+
+
+@app.get("/api/providers/{pid}/models")
+def api_provider_models(pid: int):
+    p = get_provider(pid)
+    if not p:
+        raise HTTPException(404, "配置不存在")
+    try:
+        return {"models": list_models_for(p)}
+    except Exception as e:
+        raise HTTPException(502, f"获取模型列表失败: {e}")
+
+
+@app.post("/api/providers/test")
+async def api_test_provider(body: dict = Body(...)):
+    ok, m = ping({
+        "kind": body.get("kind", "openai"),
+        "base_url": (body.get("base_url") or "").strip(),
+        "api_key": body.get("api_key", ""),
+    })
+    return {"ok": ok, "message": m}
+
+
+@app.post("/api/providers/models_probe")
+async def api_probe_models(body: dict = Body(...)):
+    """测试连接并拉取模型列表 (供前端添加模型时使用)"""
+    p = {
+        "kind": body.get("kind", "openai"),
+        "base_url": (body.get("base_url") or "").strip(),
+        "api_key": body.get("api_key", ""),
+    }
+    try:
+        models = list_models_for(p)
+        return {"ok": True, "models": models}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
 
 
 @app.get("/api/conversations")
@@ -271,6 +425,14 @@ def index():
     if html:
         return HTMLResponse(html)
     return FileResponse(resource_path("frontend.html"))
+
+
+@app.get("/logo.png")
+def logo():
+    p = resource_path("VoiceRecorderApp.png")
+    if os.path.exists(p):
+        return FileResponse(p, media_type="image/png")
+    raise HTTPException(404, "logo not found")
 
 
 # 如果静态文件目录存在则挂载

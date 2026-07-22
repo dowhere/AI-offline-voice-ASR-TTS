@@ -8,7 +8,7 @@ PyInstaller 打包配置 — AI 离线语音输入 & 对话
 """
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-datas = [("frontend.html", ".")]
+datas = [("frontend.html", "."), ("VoiceRecorderApp.png", ".")]
 binaries = []
 hiddenimports = []
 
@@ -51,19 +51,20 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="AI语音助手",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    runtime_tmpdir=None,
     console=False,        # 无控制台黑窗
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="app.ico",
 )
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False,
+               name="AI语音助手")

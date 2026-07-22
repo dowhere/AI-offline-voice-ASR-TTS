@@ -49,9 +49,33 @@ def init_db():
             created_at INTEGER NOT NULL,
             FOREIGN KEY(conversation_id) REFERENCES conversations(id)
         );
+        CREATE TABLE IF NOT EXISTS llm_providers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,            -- ollama | openai
+            base_url TEXT NOT NULL,
+            api_key TEXT DEFAULT '',
+            model TEXT DEFAULT '',
+            is_default INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
         """
     )
     c.commit()
+    _seed_default_provider()
+
+
+def _seed_default_provider():
+    """首次运行时植入本地 Ollama 默认 provider"""
+    c = _conn()
+    n = c.execute("SELECT COUNT(*) AS n FROM llm_providers").fetchone()["n"]
+    if n == 0:
+        c.execute(
+            "INSERT INTO llm_providers(name,kind,base_url,api_key,model,is_default,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("本地 Ollama", "ollama", "http://127.0.0.1:11434", "", "", 1, int(time.time())),
+        )
+        c.commit()
 
 
 # ---------- 识别记录 ----------
@@ -132,6 +156,76 @@ def get_messages(cid):
         (cid,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- LLM Provider (模型配置) ----------
+def list_providers():
+    c = _conn()
+    rows = c.execute("SELECT * FROM llm_providers ORDER BY id ASC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_provider(name, kind, base_url, api_key="", model="", is_default=0):
+    c = _conn()
+    if is_default:
+        c.execute("UPDATE llm_providers SET is_default=0")
+    cur = c.execute(
+        "INSERT INTO llm_providers(name,kind,base_url,api_key,model,is_default,created_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (name, kind, base_url.rstrip("/"), api_key, model, int(bool(is_default)), int(time.time())),
+    )
+    c.commit()
+    return cur.lastrowid
+
+
+def update_provider(pid, **fields):
+    allowed = {"name", "kind", "base_url", "api_key", "model", "is_default"}
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k in allowed:
+            sets.append(f"{k}=?")
+            vals.append(v.rstrip("/") if k == "base_url" and isinstance(v, str) else v)
+    if not sets:
+        return
+    c = _conn()
+    if fields.get("is_default"):
+        c.execute("UPDATE llm_providers SET is_default=0")
+    vals.append(pid)
+    c.execute(f"UPDATE llm_providers SET {','.join(sets)} WHERE id=?", vals)
+    c.commit()
+
+
+def delete_provider(pid):
+    c = _conn()
+    row = c.execute("SELECT is_default FROM llm_providers WHERE id=?", (pid,)).fetchone()
+    c.execute("DELETE FROM llm_providers WHERE id=?", (pid,))
+    # 若删的是默认项, 把第一个设为默认
+    if row and row["is_default"]:
+        first = c.execute("SELECT id FROM llm_providers ORDER BY id ASC LIMIT 1").fetchone()
+        if first:
+            c.execute("UPDATE llm_providers SET is_default=1 WHERE id=?", (first["id"],))
+    c.commit()
+
+
+def set_default_provider(pid):
+    c = _conn()
+    c.execute("UPDATE llm_providers SET is_default=0")
+    c.execute("UPDATE llm_providers SET is_default=1 WHERE id=?", (pid,))
+    c.commit()
+
+
+def get_default_provider():
+    c = _conn()
+    row = c.execute("SELECT * FROM llm_providers WHERE is_default=1 LIMIT 1").fetchone()
+    if not row:
+        row = c.execute("SELECT * FROM llm_providers ORDER BY id ASC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+def get_provider(pid):
+    c = _conn()
+    row = c.execute("SELECT * FROM llm_providers WHERE id=?", (pid,)).fetchone()
+    return dict(row) if row else None
 
 
 if __name__ == "__main__":

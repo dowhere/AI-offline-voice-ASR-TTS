@@ -48,7 +48,15 @@ def _setup_espeak():
         pass
 
 
-_setup_espeak()
+_setup_espeak_done = False
+
+
+def _ensure_espeak():
+    global _setup_espeak_done
+    if not _setup_espeak_done:
+        _setup_espeak()
+        _setup_espeak_done = True
+
 
 from paths import APP_DIR
 
@@ -85,6 +93,7 @@ class TTSEngine:
         self.model_dir = model_dir
         self.voices_dir = os.path.join(model_dir, "voices")
 
+        _ensure_espeak()
         from kokoro import KModel, KPipeline
         self._KPipeline = KPipeline
         self.model = KModel(config=cfg, model=ckpt).eval()

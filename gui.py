@@ -41,11 +41,11 @@ def wait_for_server(url="http://127.0.0.1:8000", timeout=30):
 def main():
     import webview
 
-    # 1) 启动后端线程
+    # 1) 启动后端线程 (仅 init_db, 秒级就绪, 不加载模型)
     t = threading.Thread(target=start_server, daemon=True)
     t.start()
 
-    # 2) 等待服务就绪
+    # 2) 等待服务就绪 (很快, 因为不再阻塞加载引擎)
     print("正在启动 AI 语音助手...")
     if not wait_for_server():
         print("服务启动失败，请检查控制台输出")
@@ -64,11 +64,23 @@ def main():
         text_select=True,
     )
 
-    # 4) 运行事件循环（阻塞直到窗口关闭）
+    # 4) 窗口显示后再触发模型加载 (界面未打开前不加载模型)
+    def _on_loaded():
+        import urllib.request
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request("http://127.0.0.1:8000/api/engines/start", method="POST"),
+                timeout=5,
+            )
+        except Exception:
+            pass
+    window.events.loaded += _on_loaded
+
+    # 5) 运行事件循环（阻塞直到窗口关闭）
     #    Windows 使用 EdgeChromium(WebView2)，需允许麦克风等媒体权限
     webview.start(private_mode=False)
 
-    # 5) 窗口关闭后退出
+    # 6) 窗口关闭后退出
     print("窗口已关闭，退出程序")
     os._exit(0)
 
