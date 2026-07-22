@@ -1,0 +1,21 @@
+node_modules/
+dist/
+*.local
+.venv/
+models/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build target
+target/
+build/
