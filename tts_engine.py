@@ -6,6 +6,7 @@ Kokoro TTS 离线语音合成引擎
 """
 import os
 import re
+import threading
 import numpy as np
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -62,6 +63,7 @@ from paths import APP_DIR
 
 MODEL_DIR = os.path.join(APP_DIR, "models", "KokoroTTS")
 SAMPLE_RATE = 24000
+MAX_CHARS = 2000          # 单次合成上限, 避免长文本占用过久
 
 # 常用中文/英文发音人 (name -> 说明)
 VOICES = {
@@ -75,12 +77,46 @@ VOICES = {
     "zm_yunxia": "云夏 (男·中文)",
     "af_heart": "Heart (女·英文)",
     "af_bella": "Bella (女·英文)",
+    "af_nicole": "Nicole (女·英文)",
+    "af_sarah": "Sarah (女·英文)",
     "am_michael": "Michael (男·英文)",
     "am_adam": "Adam (男·英文)",
+    "am_onyx": "Onyx (男·英文)",
+    "bf_emma": "Emma (女·英式)",
+    "bm_george": "George (男·英式)",
 }
 
 # 中文字符检测
 _ZH_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def clean_for_speech(text):
+    """去掉 Markdown / 思考过程等不适合朗读的内容"""
+    text = text or ""
+    text = re.sub(r"<think>[\s\S]*?</think>", " ", text, flags=re.I)
+    text = re.sub(r"<\|[^|]*\|>", " ", text)
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", text)
+    text = text.replace("`", "").replace("~~", "")
+    text = re.sub(r"https?://\S+", "链接", text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _truncate(text, limit=MAX_CHARS):
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # 尽量在句子边界截断
+    idx = max(cut.rfind(c) for c in "。！？!?.\n")
+    if idx >= limit // 2:
+        cut = cut[: idx + 1]
+    return cut.strip()
 
 
 class TTSEngine:
@@ -100,6 +136,8 @@ class TTSEngine:
         # 中/英两套 pipeline (共享同一模型权重, 只是 G2P 前端不同)
         self._pipes = {}
         self._voice_cache = {}
+        # torch/Kokoro 推理非线程安全, 串行化请求
+        self._lock = threading.Lock()
 
     def _pipe(self, lang_code):
         if lang_code not in self._pipes:
@@ -119,20 +157,30 @@ class TTSEngine:
 
     @staticmethod
     def _lang_of(voice_name):
-        # z* = 中文, 其余走英文
-        return "z" if voice_name.startswith("z") else "a"
+        # Kokoro 语言码: a=美英 b=英英 e=西 f=法 h=印地 i=意 j=日 p=葡 z=中
+        first = (voice_name or "a")[0].lower()
+        return first if first in "abefhijpz" else "a"
 
     def synthesize(self, text, voice="zf_xiaoxiao", speed=1.0):
         """合成 -> 返回 float32 numpy 波形 (24kHz 单声道)"""
-        text = (text or "").strip()
+        text = clean_for_speech(text)
         if not text:
             return np.zeros(0, dtype=np.float32)
-        vt = self._load_voice(voice)
+        text = _truncate(text)
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = max(0.5, min(2.0, speed))
+
         pipe = self._pipe(self._lang_of(voice))
         chunks = []
-        for r in pipe(text, voice=vt, speed=speed):
-            if r.audio is not None:
-                chunks.append(r.audio.numpy())
+        import torch
+        with self._lock, torch.inference_mode():
+            vt = self._load_voice(voice)
+            for r in pipe(text, voice=vt, speed=speed):
+                if r.audio is not None:
+                    chunks.append(r.audio.detach().cpu().numpy())
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32)

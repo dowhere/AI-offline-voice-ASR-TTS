@@ -18,8 +18,20 @@ _local = threading.local()
 
 def _conn():
     if not hasattr(_local, "conn"):
-        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+        conn.row_factory = sqlite3.Row
+        # WAL + busy_timeout: 识别/对话/前端轮询并发访问时避免 database is locked
+        for pragma in (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA busy_timeout=10000",
+            "PRAGMA foreign_keys=ON",
+        ):
+            try:
+                conn.execute(pragma)
+            except sqlite3.Error:
+                pass
+        _local.conn = conn
     return _local.conn
 
 
@@ -59,6 +71,8 @@ def init_db():
             is_default INTEGER DEFAULT 0,
             created_at INTEGER NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_transcripts_created ON transcripts(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
         """
     )
     c.commit()
@@ -126,6 +140,18 @@ def list_conversations():
     return [dict(r) for r in rows]
 
 
+def get_conversation(cid):
+    c = _conn()
+    row = c.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone()
+    return dict(row) if row else None
+
+
+def count_messages(cid):
+    c = _conn()
+    row = c.execute("SELECT COUNT(*) AS n FROM messages WHERE conversation_id=?", (cid,)).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def rename_conversation(cid, title):
     c = _conn()
     c.execute("UPDATE conversations SET title=? WHERE id=?", (title, cid))
@@ -182,9 +208,14 @@ def update_provider(pid, **fields):
     allowed = {"name", "kind", "base_url", "api_key", "model", "is_default"}
     sets, vals = [], []
     for k, v in fields.items():
-        if k in allowed:
-            sets.append(f"{k}=?")
-            vals.append(v.rstrip("/") if k == "base_url" and isinstance(v, str) else v)
+        if k not in allowed:
+            continue
+        if k == "base_url" and isinstance(v, str):
+            v = v.strip().rstrip("/")
+        if k == "is_default":
+            v = int(bool(v))
+        sets.append(f"{k}=?")
+        vals.append(v)
     if not sets:
         return
     c = _conn()

@@ -262,7 +262,8 @@ const $$ = s => document.querySelectorAll(s);
 const API = "";
 let currentConv = null;
 
-function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
+let toastTimer=null;
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove("show"),2200); }
 function fmtTime(ts){ const d=new Date(ts*1000); return d.toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}); }
 
 // ---------- 导航 ----------
@@ -320,7 +321,11 @@ async function sendPCM(buf,sr,lang){
   const r=await fetch(`${API}/api/asr/record?sample_rate=${sr}&language=${lang}`,{
     method:"POST", headers:{"Content-Type":"application/octet-stream"}, body:buf
   });
-  if(!r.ok) throw new Error("识别请求失败");
+  if(!r.ok){
+    let msg="识别请求失败";
+    try{ msg=(await r.json()).detail||msg; }catch(e){}
+    throw new Error(msg);
+  }
   return await r.json();
 }
 
@@ -358,18 +363,21 @@ $("#recBtn").onclick=async()=>{
 
 function showLatest(res){
   if(!res.text){ $("#latestResult").innerHTML='<div class="empty">未识别到语音内容</div>'; return; }
+  const saved=res.saved!==false;
   $("#latestResult").innerHTML=`<div class="rec-item">
     <div class="content">
       <div class="text">${escapeHtml(res.text)}</div>
       <div class="meta">
-        ${res.language?`<span class="chip lang">${res.language}</span>`:""}
-        ${res.emotion?`<span class="chip emo">${res.emotion}</span>`:""}
+        ${res.language?`<span class="chip lang">${escapeHtml(res.language)}</span>`:""}
+        ${res.emotion?`<span class="chip emo">${escapeHtml(res.emotion)}</span>`:""}
         <span>${res.duration}s</span>
-        <span style="color:var(--green)">✓ 已保存到记录</span>
+        <span style="color:${saved?"var(--green)":"var(--muted)"}">${saved?"✓ 已保存到记录":"未保存"}</span>
       </div>
     </div>
-    <button class="icon-btn" onclick="copyText('${escapeAttr(res.text)}')" style="color:var(--accent)">📋</button>
+    <button class="icon-btn copy-btn" style="color:var(--accent)">📋</button>
   </div>`;
+  const btn=$("#latestResult .copy-btn");
+  if(btn) btn.onclick=()=>copyText(res.text);
 }
 
 // 上传
@@ -397,18 +405,29 @@ async function loadHistory(){
     <div class="content">
       <div class="text">${escapeHtml(it.text)}</div>
       <div class="meta">
-        ${it.language?`<span class="chip lang">${it.language}</span>`:""}
-        ${it.emotion?`<span class="chip emo">${it.emotion}</span>`:""}
+        ${it.language?`<span class="chip lang">${escapeHtml(it.language)}</span>`:""}
+        ${it.emotion?`<span class="chip emo">${escapeHtml(it.emotion)}</span>`:""}
         <span>${it.duration}s</span>
         <span>${it.source==="record"?"🎙 录音":"📁 上传"}</span>
         <span>${fmtTime(it.created_at)}</span>
       </div>
     </div>
-    <button class="icon-btn" onclick="copyText('${escapeAttr(it.text)}')" style="color:var(--accent)">📋</button>
-    <button class="icon-btn" onclick="delHist(${it.id})">🗑</button>
+    <button class="icon-btn" data-copy="${escapeHtml(it.text)}" style="color:var(--accent)">📋</button>
+    <button class="icon-btn" data-del="${it.id}">🗑</button>
   </div>`).join("");
 }
-async function delHist(id){ await fetch(`${API}/api/transcripts/${id}`,{method:"DELETE"}); loadHistory(); }
+async function delHist(id){
+  try{ await fetch(`${API}/api/transcripts/${id}`,{method:"DELETE"}); }
+  catch(e){ toast("删除失败"); }
+  loadHistory();
+}
+// 事件委托处理复制/删除, 避免把文本拼进 onclick 导致转义问题
+$("#histList").addEventListener("click",e=>{
+  const cp=e.target.closest("[data-copy]");
+  if(cp){ copyText(cp.dataset.copy); return; }
+  const dl=e.target.closest("[data-del]");
+  if(dl) delHist(parseInt(dl.dataset.del,10));
+});
 $("#clearBtn").onclick=async()=>{ if(confirm("确认清空全部识别记录?")){ await fetch(`${API}/api/transcripts`,{method:"DELETE"}); loadHistory(); } };
 $("#exportBtn").onclick=async()=>{
   const r=await fetch(`${API}/api/transcripts`); const list=await r.json();
@@ -419,56 +438,115 @@ $("#exportBtn").onclick=async()=>{
 
 // ---------- 对话页: 模型下拉 (来自已配置 providers) ----------
 let chatProviders=[];
+function savedModelValue(){ try{ return localStorage.getItem("selectedModel")||""; }catch(e){ return ""; } }
 async function loadModels(force){
-  if($("#modelSel").dataset.loaded && !force) return;
+  const sel=$("#modelSel");
+  if(sel.dataset.loaded && !force) return;
   try{
-    const r=await fetch(`${API}/api/providers`); chatProviders=await r.json();
-    const sel=$("#modelSel"); sel.innerHTML="";
-    for(const p of chatProviders){
-      // 每个 provider 拉取其模型列表; 失败则用其默认 model 或占位
-      let models=[];
-      try{ const mr=await fetch(`${API}/api/providers/${p.id}/models`); if(mr.ok) models=(await mr.json()).models||[]; }catch(e){}
-      if(!models.length && p.model) models=[p.model];
+    const r=await fetch(`${API}/api/providers`);
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    chatProviders=await r.json();
+    // 并行拉取各 provider 的模型列表, 避免逐个等待 (离线 provider 会超时)
+    const modelLists=await Promise.all(chatProviders.map(async p=>{
+      try{
+        const mr=await fetch(`${API}/api/providers/${p.id}/models`);
+        if(mr.ok) return (await mr.json()).models||[];
+      }catch(e){}
+      return p.model?[p.model]:[];
+    }));
+
+    sel.innerHTML="";
+    chatProviders.forEach((p,i)=>{
+      const models=modelLists[i]||[];
+      if(!models.length) return;
       const og=document.createElement("optgroup"); og.label=p.name;
       for(const m of models){
         const o=document.createElement("option");
         o.value=`${p.id}|${m}`; o.textContent=m;
-        if(p.is_default && (m===p.model||!p.model)) o.selected=true;
         og.appendChild(o);
       }
-      if(models.length) sel.appendChild(og);
+      sel.appendChild(og);
+    });
+
+    if(!sel.options.length){
+      sel.innerHTML='<option value="">请先在模型管理中配置</option>';
+    }else{
+      const saved=savedModelValue();
+      const opts=[...sel.options];
+      const pick=opts.find(o=>o.value===saved)
+        ||opts.find(o=>{ const p=chatProviders.find(x=>x.id===parseInt(o.value,10)); return p&&p.is_default; })
+        ||opts[0];
+      if(pick) sel.value=pick.value;
     }
-    if(!sel.options.length){ sel.innerHTML='<option value="">请先在模型管理中配置</option>'; }
     sel.dataset.loaded="1";
-  }catch(e){}
+  }catch(e){ toast("加载模型列表失败: "+e.message); }
 }
+$("#modelSel").addEventListener("change",()=>{
+  try{ if($("#modelSel").value) localStorage.setItem("selectedModel",$("#modelSel").value); }catch(e){}
+});
 
 // ---------- 模型管理 ----------
 let editingProviderId=null;
 async function loadProviders(){
-  const r=await fetch(`${API}/api/providers`); const list=await r.json();
-  const box=$("#providerList");
-  if(!list.length){ box.innerHTML='<div class="empty">暂无配置，点击上方按钮添加模型</div>'; return; }
-  box.innerHTML=list.map(p=>`<div class="provider-card ${p.is_default?'is-default':''}">
-    <div class="provider-info">
-      <div class="pn">
-        ${escapeHtml(p.name)}
-        ${p.is_default?'<span class="badge default">默认</span>':''}
-        <span class="badge kind">${p.kind==='ollama'?'本地':'在线'}</span>
+  try{
+    const r=await fetch(`${API}/api/providers`);
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const list=await r.json();
+    const box=$("#providerList");
+    if(!list.length){ box.innerHTML='<div class="empty">暂无配置，点击上方按钮添加模型</div>'; return; }
+    box.innerHTML=list.map(p=>`<div class="provider-card ${p.is_default?'is-default':''}">
+      <div class="provider-info">
+        <div class="pn">
+          ${escapeHtml(p.name)}
+          ${p.is_default?'<span class="badge default">默认</span>':''}
+          <span class="badge kind">${p.kind==='ollama'?'本地':'在线'}</span>
+        </div>
+        <div class="pmeta">${escapeHtml(p.base_url)} ${p.model?' · '+escapeHtml(p.model):''} ${p.has_key?' · [已配置 API Key]':' · [无 Key]'}</div>
       </div>
-      <div class="pmeta">${escapeHtml(p.base_url)} ${p.model?' · '+escapeHtml(p.model):''} ${p.has_key?' · [已配置 API Key]':' · [无 Key]'}</div>
-    </div>
-    <div class="provider-acts">
-      ${!p.is_default?`<button class="mini-btn" onclick="setDefault(${p.id})">设为默认</button>`:''}
-      <button class="mini-btn" onclick="editProvider(${p.id})">编辑</button>
-      <button class="mini-btn danger" onclick="delProvider(${p.id})">删除</button>
-    </div>
-  </div>`).join("");
+      <div class="provider-acts">
+        ${!p.is_default?`<button class="mini-btn" onclick="setDefault(${p.id})">设为默认</button>`:''}
+        <button class="mini-btn" onclick="editProvider(${p.id})">编辑</button>
+        <button class="mini-btn danger" onclick="delProvider(${p.id})">删除</button>
+      </div>
+    </div>`).join("");
+  }catch(e){ toast("加载模型配置失败: "+e.message); }
 }
-async function setDefault(id){ await fetch(`${API}/api/providers/${id}/default`,{method:"POST"}); loadProviders(); loadModels(true); }
-async function delProvider(id){ if(!confirm("确认删除该模型配置?"))return; await fetch(`${API}/api/providers/${id}`,{method:"DELETE"}); loadProviders(); loadModels(true); }
-function openModal(p){ editingProviderId=p; $("#pmMsg").textContent=""; $("#pmKind").value=p?p.kind:"openai"; toggleKeyFld(); $("#pmName").value=p?p.name:""; $("#pmUrl").value=p?p.base_url:""; $("#pmKey").value=""; $("#pmModel").value=p?p.model||"":""; $("#pmModelList").innerHTML=""; $("#pmModelList").style.display="none"; $("#pmTitle").textContent=p?"编辑模型":"添加模型"; $("#providerModal").classList.add("show"); }
-function editProvider(id){ fetch(`${API}/api/providers/${id}`).then(r=>r.json()).then(p=>{ p.id=id; delete p.has_key; openModal(p); }); }
+async function setDefault(id){
+  try{
+    const r=await fetch(`${API}/api/providers/${id}/default`,{method:"POST"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    await loadProviders(); loadModels(true);
+  }catch(e){ toast("设置失败: "+e.message); }
+}
+async function delProvider(id){
+  if(!confirm("确认删除该模型配置?"))return;
+  try{
+    const r=await fetch(`${API}/api/providers/${id}`,{method:"DELETE"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    await loadProviders(); loadModels(true);
+  }catch(e){ toast("删除失败: "+e.message); }
+}
+function openModal(p){
+  editingProviderId = p && p.id ? p.id : null;
+  const msg=$("#pmMsg"); msg.textContent=""; msg.className="pm-msg";
+  $("#pmKind").value=p?p.kind:"openai";
+  toggleKeyFld();
+  $("#pmName").value=p?p.name:"";
+  $("#pmUrl").value=p?p.base_url:"";
+  $("#pmKey").value="";
+  $("#pmKey").placeholder = p && p.has_key ? "已配置，留空则不修改" : "sk-...";
+  $("#pmModel").value=p?p.model||"":"";
+  $("#pmModelList").innerHTML=""; $("#pmModelList").style.display="none";
+  $("#pmTitle").textContent=p?"编辑模型":"添加模型";
+  $("#providerModal").classList.add("show");
+}
+async function editProvider(id){
+  try{
+    const r=await fetch(`${API}/api/providers/${id}`);
+    if(!r.ok) throw new Error("配置不存在");
+    openModal(await r.json());
+  }catch(e){ toast("读取配置失败: "+e.message); }
+}
 $("#addProviderBtn").onclick=()=>openModal(null);
 $("#pmCancel").onclick=()=>{ $("#providerModal").classList.remove("show"); };
 $("#pmKind").onchange=toggleKeyFld;
@@ -484,7 +562,10 @@ $("#pmFetchModels").onclick=async()=>{
     if(!d.ok){ msg.className="pm-msg err"; msg.textContent=d.message||"拉取失败"; return; }
     const sl=$("#pmModelList");
     if(d.models&&d.models.length){
-      sl.innerHTML=d.models.map(m=>`<option value="${m}">${m}</option>`).join("");
+      sl.innerHTML="";
+      for(const m of d.models){
+        const o=document.createElement("option"); o.value=m; o.textContent=m; sl.appendChild(o);
+      }
       sl.style.display="block";
       sl.onchange=()=>{ $("#pmModel").value=sl.value; };
       if(!$("#pmModel").value) $("#pmModel").value=d.models[0];
@@ -506,58 +587,114 @@ $("#pmTest").onclick=async()=>{
 $("#pmSave").onclick=async()=>{
   const name=$("#pmName").value.trim(), kind=$("#pmKind").value, url=$("#pmUrl").value.trim(), key=$("#pmKey").value, model=$("#pmModel").value.trim();
   if(!name||!url) return toast("名称和地址不能为空");
-  const body={name,kind,base_url:url,api_key:key,model,is_default:!chatProviders.length||$("#providerList").querySelector(".provider-card.is-default")?undefined:1};
+  const body={name,kind,base_url:url,model};
+  if(key) body.api_key=key;   // 编辑时留空 = 保持原有 Key 不变
+  const btn=$("#pmSave"); btn.disabled=true;
   try{
+    let r;
     if(editingProviderId){
-      await fetch(`${API}/api/providers/${editingProviderId}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      r=await fetch(`${API}/api/providers/${editingProviderId}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     }else{
-      const r=await fetch(`${API}/api/providers`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-      const d=await r.json(); editingProviderId=d.id;
+      // 第一个模型自动设为默认
+      const hasDefault=!!document.querySelector("#providerList .provider-card.is-default");
+      if(!hasDefault) body.is_default=1;
+      r=await fetch(`${API}/api/providers`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     }
-    $("#providerModal").classList.remove("show"); loadProviders(); loadModels(true); toast("已保存");
-  }catch(e){toast("保存失败: "+e.message);}
+    if(!r.ok){
+      let m="HTTP "+r.status;
+      try{ m=(await r.json()).detail||m; }catch(e){}
+      throw new Error(m);
+    }
+    $("#providerModal").classList.remove("show");
+    await loadProviders();
+    $("#modelSel").dataset.loaded="";
+    loadModels(true);
+    toast("已保存");
+  }catch(e){ toast("保存失败: "+e.message); }
+  finally{ btn.disabled=false; }
 };
-let currentAudio=null;
+let currentAudio=null, currentAudioUrl=null;
 async function loadVoices(){
   if($("#voiceSel").dataset.loaded)return;
   try{
-    const r=await fetch(`${API}/api/tts/voices`); const {voices}=await r.json();
-    $("#voiceSel").innerHTML=voices.map(v=>`<option value="${v.id}">${v.name}</option>`).join("");
-    $("#voiceSel").dataset.loaded="1";
+    const r=await fetch(`${API}/api/tts/voices`);
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const {voices}=await r.json();
+    const sel=$("#voiceSel");
+    sel.innerHTML="";
+    for(const v of voices){
+      const o=document.createElement("option"); o.value=v.id; o.textContent=v.name; sel.appendChild(o);
+    }
+    let saved="";
+    try{ saved=localStorage.getItem("selectedVoice")||""; }catch(e){}
+    if(saved && [...sel.options].some(o=>o.value===saved)) sel.value=saved;
+    sel.dataset.loaded="1";
   }catch(e){}
 }
-function stopSpeak(){ if(currentAudio){ currentAudio.pause(); currentAudio=null; } }
+$("#voiceSel").addEventListener("change",()=>{
+  try{ localStorage.setItem("selectedVoice",$("#voiceSel").value); }catch(e){}
+});
+(function initAutoPlay(){
+  const chk=$("#autoPlayChk");
+  try{ chk.checked=localStorage.getItem("autoPlay")!=="0"; }catch(e){}
+  chk.addEventListener("change",()=>{ try{ localStorage.setItem("autoPlay",chk.checked?"1":"0"); }catch(e){} });
+})();
+function stopSpeak(){
+  if(currentAudio){ currentAudio.pause(); currentAudio.onended=null; currentAudio=null; }
+  if(currentAudioUrl){ URL.revokeObjectURL(currentAudioUrl); currentAudioUrl=null; }
+}
 async function speak(text,btn){
   stopSpeak();
-  const clean=(text||"").replace(/<think>[\s\S]*?<\/think>/g,"").trim();
+  const clean=(text||"")
+    .replace(/<think>[\s\S]*?<\/think>/gi,"")
+    .replace(/```[\s\S]*?```/g,"")
+    .replace(/[`*_#>]/g,"")
+    .replace(/\s+/g," ")
+    .trim();
   if(!clean) return;
-  if(btn){ btn.textContent="⏳"; }
+  if(btn){ btn.textContent="⏳"; btn.disabled=true; }
   try{
     const r=await fetch(`${API}/api/tts`,{
       method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({text:clean,voice:$("#voiceSel").value||"zf_xiaoxiao"})
     });
-    if(!r.ok) throw new Error("合成失败");
+    if(!r.ok){
+      let m="合成失败";
+      try{ m=(await r.json()).detail||m; }catch(e){}
+      throw new Error(m);
+    }
     const blob=await r.blob();
+    if(!blob.size) throw new Error("合成结果为空");
     const url=URL.createObjectURL(blob);
+    currentAudioUrl=url;
     currentAudio=new Audio(url);
-    if(btn){ btn.textContent="🔊"; }
-    currentAudio.onended=()=>{ URL.revokeObjectURL(url); currentAudio=null; };
+    if(btn){ btn.textContent="🔊"; btn.disabled=false; }
+    currentAudio.onended=()=>{ stopSpeak(); };
     await currentAudio.play();
-  }catch(e){ if(btn)btn.textContent="🔊"; toast("朗读失败: "+e.message); }
+  }catch(e){
+    if(btn){ btn.textContent="🔊"; btn.disabled=false; }
+    toast("朗读失败: "+e.message);
+  }
 }
 
 async function loadConversations(){
-  const r=await fetch(`${API}/api/conversations`); const list=await r.json();
-  $("#convItems").innerHTML=list.map(c=>`<div class="conv-item ${c.id===currentConv?"active":""}" data-id="${c.id}">
-    <span class="t" onclick="openConv(${c.id})">${escapeHtml(c.title)}</span>
-    <button class="icon-btn" onclick="delConv(${c.id})" style="padding:2px">✕</button>
-  </div>`).join("")||'<div class="empty" style="padding:20px;font-size:12px">暂无对话</div>';
+  try{
+    const r=await fetch(`${API}/api/conversations`);
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const list=await r.json();
+    $("#convItems").innerHTML=list.map(c=>`<div class="conv-item ${c.id===currentConv?"active":""}" data-id="${c.id}">
+      <span class="t" onclick="openConv(${c.id})" ondblclick="renameConv(event,${c.id})" title="双击重命名">${escapeHtml(c.title)}</span>
+      <button class="icon-btn" onclick="delConv(event,${c.id})" style="padding:2px">✕</button>
+    </div>`).join("")||'<div class="empty" style="padding:20px;font-size:12px">暂无对话</div>';
+  }catch(e){ toast("加载对话失败: "+e.message); }
 }
 async function openConv(id){
   currentConv=id; loadConversations();
-  const r=await fetch(`${API}/api/conversations/${id}/messages`); const msgs=await r.json();
-  renderMsgs(msgs);
+  try{
+    const r=await fetch(`${API}/api/conversations/${id}/messages`);
+    if(!r.ok) throw new Error("会话不存在");
+    renderMsgs(await r.json());
+  }catch(e){ toast("打开对话失败: "+e.message); }
 }
 function renderMsgs(msgs){
   const box=$("#msgs");
@@ -565,22 +702,85 @@ function renderMsgs(msgs){
   box.innerHTML=msgs.map(m=>renderMsg(m.role,m.content)).join("");
   box.scrollTop=box.scrollHeight;
 }
-function renderMsg(role,content){
-  if(role==="user") return `<div class="msg user">${escapeHtml(content)}</div>`;
-  // 拆分 <think>
-  let think="",text=content;
-  const tm=content.match(/<think>([\s\S]*?)<\/think>/);
-  if(tm){ think=tm[1].trim(); text=content.replace(/<think>[\s\S]*?<\/think>/,"").trim(); }
-  return `<div class="msg assistant">
+function splitThink(content){
+  content=content||"";
+  let think="", text=content;
+  const m=content.match(/<think>([\s\S]*?)<\/think>/i);
+  if(m){
+    think=m[1].trim();
+    text=content.replace(/<think>[\s\S]*?<\/think>/i,"").trim();
+  }else{
+    const open=content.search(/<think>/i);
+    if(open>=0){ think=content.slice(open+7).trim(); text=content.slice(0,open).trim(); }
+  }
+  return {think,text};
+}
+function renderMsg(role,content,id){
+  const idAttr=id?` id="${id}"`:"";
+  if(role==="user") return `<div class="msg user"${idAttr}>${escapeHtml(content)}</div>`;
+  const {think,text}=splitThink(content);
+  return `<div class="msg assistant"${idAttr}>
     ${think?`<div class="think-toggle" onclick="this.nextElementSibling.classList.toggle('show')">💭 显示思考过程</div><div class="think">${escapeHtml(think)}</div>`:""}
     <div class="body">${escapeHtml(text)}</div>
     ${text?`<button class="speak-btn" onclick="speak(this.previousElementSibling.textContent,this)" title="朗读">🔊</button>`:""}
   </div>`;
 }
-async function delConv(id){ event.stopPropagation(); await fetch(`${API}/api/conversations/${id}`,{method:"DELETE"}); if(currentConv===id){currentConv=null; $("#msgs").innerHTML='<div class="empty">开始对话吧 👋</div>';} loadConversations(); }
+// 流式更新: 只改文本节点, 避免每个 chunk 重建整个消息导致卡顿
+function updateStreamMsg(aid,text,think,speakable=true){
+  const el=document.getElementById(aid); if(!el) return;
+  const sp=el.querySelector(".spinner"); if(sp) sp.remove();
+  let thinkEl=el.querySelector(".think");
+  if(think){
+    if(!thinkEl){
+      const toggle=document.createElement("div");
+      toggle.className="think-toggle";
+      toggle.textContent="💭 显示思考过程";
+      thinkEl=document.createElement("div");
+      thinkEl.className="think";
+      toggle.onclick=()=>thinkEl.classList.toggle("show");
+      el.insertBefore(toggle,el.firstChild);
+      el.insertBefore(thinkEl,toggle.nextSibling);
+    }
+    thinkEl.textContent=think;
+  }
+  let body=el.querySelector(".body");
+  if(!body){ body=document.createElement("div"); body.className="body"; el.appendChild(body); }
+  body.textContent=text || (think ? "思考中…" : "");
+  let btn=el.querySelector(".speak-btn");
+  if(text && speakable && !btn){
+    btn=document.createElement("button");
+    btn.className="speak-btn"; btn.textContent="🔊"; btn.title="朗读";
+    btn.onclick=()=>speak(body.textContent,btn);
+    el.appendChild(btn);
+  }else if((!text || !speakable) && btn){ btn.remove(); }
+}
+async function delConv(ev,id){
+  if(ev) ev.stopPropagation();
+  if(!confirm("确认删除该对话?")) return;
+  try{
+    const r=await fetch(`${API}/api/conversations/${id}`,{method:"DELETE"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    if(currentConv===id){ currentConv=null; $("#msgs").innerHTML='<div class="empty">开始对话吧 👋</div>'; }
+    loadConversations();
+  }catch(e){ toast("删除失败: "+e.message); }
+}
+async function renameConv(ev,id){
+  if(ev) ev.stopPropagation();
+  const cur=ev&&ev.target?ev.target.textContent:"";
+  const title=prompt("重命名对话",cur);
+  if(title===null) return;
+  const t=title.trim(); if(!t) return;
+  try{
+    const r=await fetch(`${API}/api/conversations/${id}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:t})});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    loadConversations();
+  }catch(e){ toast("重命名失败: "+e.message); }
+}
 $("#newConvBtn").onclick=()=>{ currentConv=null; $("#msgs").innerHTML='<div class="empty">开始一段新对话吧 👋</div>'; loadConversations(); };
 
+let sending=false;
 async function sendMessage(){
+  if(sending) return;
   const inp=$("#chatInput"); const msg=inp.value.trim(); if(!msg)return;
   inp.value=""; inp.style.height="44px";
   const box=$("#msgs");
@@ -588,34 +788,68 @@ async function sendMessage(){
   box.insertAdjacentHTML("beforeend",renderMsg("user",msg));
   const aid="a"+Date.now();
   box.insertAdjacentHTML("beforeend",`<div class="msg assistant" id="${aid}"><span class="spinner"></span></div>`);
+  const nearBottom=()=>box.scrollHeight-box.scrollTop-box.clientHeight<120;
   box.scrollTop=box.scrollHeight;
+
+  sending=true; $("#sendBtn").disabled=true;
+  let full="",think="";
   try{
     const r=await fetch(`${API}/api/chat/stream`,{
       method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({conversation_id:currentConv,message:msg,...parseModelSel()})
     });
+    if(!r.ok){
+      let m="HTTP "+r.status;
+      try{ m=(await r.json()).detail||m; }catch(e){}
+      throw new Error(m);
+    }
     const reader=r.body.getReader(); const dec=new TextDecoder();
-    let full="",buf="";
+    let buf="", errMsg="";
     while(true){
       const {done,value}=await reader.read(); if(done)break;
       buf+=dec.decode(value,{stream:true});
-      const lines=buf.split("\n\n"); buf=lines.pop();
-      for(const l of lines){
-        if(!l.startsWith("data:"))continue;
-        const d=JSON.parse(l.slice(5).trim());
-        if(d.conversation_id&&!currentConv){ currentConv=d.conversation_id; loadConversations(); }
-        full+=d.text;
-        $("#"+aid).outerHTML=renderMsg("assistant",full).replace('class="msg assistant"',`class="msg assistant" id="${aid}"`);
-        box.scrollTop=box.scrollHeight;
+      const parts=buf.split("\n\n"); buf=parts.pop();
+      for(const part of parts){
+        const line=part.trim();
+        if(!line.startsWith("data:")) continue;
+        let d;
+        try{ d=JSON.parse(line.slice(5).trim()); }catch(e){ continue; }
+        if(d.conversation_id && currentConv!==d.conversation_id){
+          currentConv=d.conversation_id;
+          loadConversations();
+        }
+        if(d.reasoning) think+=d.reasoning;
+        if(d.text) full+=d.text;
+        if(d.error) errMsg=errMsg||d.error;
+        updateStreamMsg(aid,full,think);
+        if(nearBottom()) box.scrollTop=box.scrollHeight;
       }
     }
-    loadConversations();
+    if(!full.trim()){
+      const fallback = errMsg ? "⚠ "+errMsg
+        : (think.trim() ? "（仅返回了思考过程，无正文）" : "（无回复）");
+      updateStreamMsg(aid,fallback,think,false);
+    }else if(errMsg){
+      toast(errMsg);
+    }
+    // 刷新会话列表 (新会话标题由后端用首条消息生成)
+    if(currentConv) loadConversations();
     // 自动朗读 AI 回复
-    if($("#autoPlayChk").checked && full.trim()){ speak(full); }
-  }catch(e){ $("#"+aid).innerHTML="出错: "+e.message; }
+    if($("#autoPlayChk").checked && full.trim()) speak(full);
+  }catch(e){
+    updateStreamMsg(aid,"⚠ "+e.message,think,false);
+    toast("对话失败: "+e.message);
+  }finally{
+    sending=false; $("#sendBtn").disabled=false;
+  }
 }
 $("#sendBtn").onclick=sendMessage;
-$("#chatInput").addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); sendMessage(); } });
+$("#chatInput").addEventListener("keydown",e=>{
+  // isComposing: 中文输入法选词时按 Enter 不应发送
+  if(e.key==="Enter" && !e.shiftKey && !e.isComposing && e.keyCode!==229){
+    e.preventDefault(); sendMessage();
+  }
+});
 $("#chatInput").addEventListener("input",function(){ this.style.height="44px"; this.style.height=Math.min(140,this.scrollHeight)+"px"; });
 
 // 对话语音输入
@@ -623,8 +857,11 @@ let chatRec=new Recorder();
 $("#chatMic").onclick=async()=>{
   const btn=$("#chatMic");
   if(!chatRec.recording){
-    try{ await chatRec.start(); btn.classList.add("recording"); btn.textContent="⏹"; toast("录音中，再次点击结束"); }
-    catch(e){ toast("无法访问麦克风"); }
+    try{
+      await chatRec.start();
+      btn.classList.add("recording"); btn.textContent="⏹";
+      toast("录音中，再次点击结束");
+    }catch(e){ toast("无法访问麦克风: "+e.message); }
   }else{
     const {pcm,sampleRate}=chatRec.stop();
     btn.classList.remove("recording"); btn.textContent="🎙️";
@@ -633,7 +870,7 @@ $("#chatMic").onclick=async()=>{
       const res=await sendPCM(pcm,sampleRate,$("#langSel").value);
       if(res.text){ const inp=$("#chatInput"); inp.value+=(inp.value?" ":"")+res.text; inp.focus(); toast("已转文字"); }
       else toast("未识别到内容");
-    }catch(e){ toast("识别失败"); }
+    }catch(e){ toast("识别失败: "+e.message); }
   }
 };
 
@@ -642,11 +879,22 @@ function parseModelSel(){
   const v=$("#modelSel").value||"";
   const i=v.indexOf("|");
   if(i<0) return {};
-  return {provider_id:parseInt(v.slice(0,i)), model:v.slice(i+1)};
+  return {provider_id:parseInt(v.slice(0,i),10), model:v.slice(i+1)};
 }
 function escapeHtml(s){ return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-function escapeAttr(s){ return (s||"").replace(/'/g,"\\'").replace(/\n/g," "); }
-function copyText(t){ navigator.clipboard.writeText(t).then(()=>toast("已复制")); }
+async function copyText(t){
+  try{
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(t);
+    }else{
+      const ta=document.createElement("textarea");
+      ta.value=t; ta.style.position="fixed"; ta.style.opacity="0";
+      document.body.appendChild(ta); ta.select();
+      document.execCommand("copy"); ta.remove();
+    }
+    toast("已复制");
+  }catch(e){ toast("复制失败"); }
+}
 
 // ---------- 模型加载状态轮询 ----------
 const STATUS_TXT={loading:"加载中…",ready:"就绪",error:"失败"};

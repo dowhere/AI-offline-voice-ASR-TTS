@@ -7,6 +7,7 @@ SenseVoice-Small ONNX 离线语音识别引擎
 import os
 import re
 import wave
+import threading
 import numpy as np
 import soxr
 import kaldi_native_fbank as knf
@@ -50,25 +51,34 @@ class ASREngine:
         with open(tok_path, "rb") as f:
             self.sp.load_from_serialized_proto(f.read())
         self.vocab_size = self.sp.get_piece_size()
+        # onnxruntime 本身线程安全, 但这里串行化可避免并发请求争抢 CPU 与内存峰值
+        self._lock = threading.Lock()
 
     # ---------- 前端 ----------
     @staticmethod
     def _read_wav(path):
-        w = wave.open(path, "rb")
-        sr, n, ch, sw = w.getframerate(), w.getnframes(), w.getnchannels(), w.getsampwidth()
-        raw = w.readframes(n)
-        w.close()
-        dt = {1: np.int8, 2: np.int16, 4: np.int32}[sw]
-        audio = np.frombuffer(raw, dtype=dt).astype(np.float32)
-        if sw == 2:
-            audio /= 32768.0
+        with wave.open(path, "rb") as w:
+            sr, n, ch, sw = w.getframerate(), w.getnframes(), w.getnchannels(), w.getsampwidth()
+            raw = w.readframes(n)
+        if sw == 1:                       # 8-bit WAV 是无符号
+            audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        elif sw == 2:
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sw == 3:                     # 24-bit
+            b = np.frombuffer(raw, dtype=np.uint8)
+            b = b[: (len(b) // 3) * 3].reshape(-1, 3).astype(np.int32)
+            v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+            v = np.where(v >= (1 << 23), v - (1 << 24), v)
+            audio = v.astype(np.float32) / float(1 << 23)
         elif sw == 4:
-            audio /= 2147483648.0
+            audio = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"不支持的 WAV 位深: {sw * 8} bit")
         if ch > 1:
             audio = audio.reshape(-1, ch).mean(axis=1)
         if sr != 16000:
             audio = soxr.resample(audio, sr, 16000)
-        return audio.astype(np.float32)
+        return np.ascontiguousarray(audio, dtype=np.float32)
 
     @staticmethod
     def _fbank(audio):
@@ -108,6 +118,8 @@ class ASREngine:
 
     # ---------- 推理 ----------
     def _infer(self, audio, language="auto", use_itn=True):
+        if audio is None or audio.size < 160:   # 少于 10ms 视为无语音
+            return ""
         feat = self._fbank(audio)
         if feat.shape[0] == 0:
             return ""
@@ -119,10 +131,11 @@ class ASREngine:
         norm_id = TEXTNORM["withitn"] if use_itn else TEXTNORM["woitn"]
         prompt = np.array([[lang_id, 1, 2, norm_id]], dtype=np.int64)
 
-        enc_out = self.enc.run(
-            None, {"speech_feat": speech, "mask": mask, "prompt_ids": prompt}
-        )[0]
-        _, topk_idx = self.ctc.run(None, {"enc_out": enc_out.astype(np.float16)})
+        with self._lock:
+            enc_out = self.enc.run(
+                None, {"speech_feat": speech, "mask": mask, "prompt_ids": prompt}
+            )[0]
+            _, topk_idx = self.ctc.run(None, {"enc_out": enc_out.astype(np.float16)})
         top1 = topk_idx[0, :, 0].tolist()
 
         ids, prev = [], -1
@@ -156,10 +169,20 @@ class ASREngine:
 
     def transcribe_pcm16(self, pcm_bytes, sample_rate, language="auto", use_itn=True):
         """直接处理原始 PCM16 单声道字节流"""
+        try:
+            sample_rate = int(sample_rate)
+        except (TypeError, ValueError):
+            sample_rate = 16000
+        if sample_rate <= 0:
+            sample_rate = 16000
+        if len(pcm_bytes) % 2:                 # 丢弃不完整的半采样
+            pcm_bytes = pcm_bytes[:-1]
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if audio.size == 0:
+            return {"text": "", "language": "", "emotion": "", "raw": "", "duration": 0.0}
         if sample_rate != 16000:
             audio = soxr.resample(audio, sample_rate, 16000)
-        raw = self._infer(audio.astype(np.float32), language, use_itn)
+        raw = self._infer(np.ascontiguousarray(audio, dtype=np.float32), language, use_itn)
         r = self._parse(raw)
         r["duration"] = round(len(audio) / 16000, 2)
         return r

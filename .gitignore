@@ -2,7 +2,10 @@ node_modules/
 dist/
 *.local
 .venv/
+.venv_tts/
 models/
+__pycache__/
+*.py[cod]
 
 # IDE
 .vscode/
