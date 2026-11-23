@@ -2,14 +2,26 @@
 """
 PyInstaller 打包配置 — AI 离线语音输入 & 对话
 - onedir 免解压, windowed 无黑窗
+- 输出目录与 exe 文件名自动带版本号 (读取 version.py)
 - frontend.html 打包进内部
 - version_info.txt 写入 Windows 文件版本属性
 - models/ 不打包 (447MB), 运行时从 exe 同级目录读取
 构建: pyinstaller AI语音助手.spec --noconfirm
 """
+import os
+import sys
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-datas = [("frontend.html", "."), ("VoiceRecorderApp.png", ".")]
+# 读取版本号, 使输出目录/exe 文件名带版本
+if SPECPATH not in sys.path:
+    sys.path.insert(0, SPECPATH)
+from version import __version__
+
+APP_NAME = f"AI语音助手-v{__version__}"
+
+datas = [(os.path.join(SPECPATH, "frontend.html"), "."),
+         (os.path.join(SPECPATH, "VoiceRecorderApp.png"), ".")]
 binaries = []
 hiddenimports = []
 
@@ -37,7 +49,7 @@ hiddenimports += [
 
 
 a = Analysis(
-    ["gui.py"],
+    [os.path.join(SPECPATH, "gui.py")],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -54,7 +66,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="AI语音助手",
+    name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -65,8 +77,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="app.ico",
-    version="version_info.txt",
+    icon=os.path.join(SPECPATH, "app.ico"),
+    version=os.path.join(SPECPATH, "version_info.txt"),
 )
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False,
-               name="AI语音助手")
+               name=APP_NAME)
