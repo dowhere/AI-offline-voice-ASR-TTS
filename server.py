@@ -31,6 +31,7 @@ from db import add_message, get_messages, get_conversation, count_messages
 from db import (list_providers, add_provider, update_provider, delete_provider,
                 set_default_provider, get_default_provider, get_provider)
 from paths import APP_DIR, resource_path
+from version import APP_NAME, __version__
 
 _DIR = APP_DIR
 
@@ -44,7 +45,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "便于语音朗读；除非用户明确要求，不要输出大段 Markdown 表格或代码块。"
 )
 
-app = FastAPI(title="AI 离线语音输入 & 对话", version="1.1.0")
+app = FastAPI(title=APP_NAME, version=__version__)
 
 # ---------- 引擎加载状态 ----------
 ENGINE_STATUS = {
@@ -170,7 +171,12 @@ def api_start_engines():
 
 @app.get("/api/status")
 def api_status():
-    return ENGINE_STATUS
+    return {**ENGINE_STATUS, "version": __version__}
+
+
+@app.get("/api/version")
+def api_version():
+    return {"name": APP_NAME, "version": __version__}
 
 
 # ---------- ASR 接口 ----------

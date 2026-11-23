@@ -1,0 +1,39 @@
+# UTF-8
+#
+# PyInstaller Windows 版本信息文件
+# 版本号需与 version.py 中的 VERSION_TUPLE 保持一致
+#
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '080404b0',
+          [
+            StringStruct('CompanyName', 'zq'),
+            StringStruct('FileDescription', 'AI 离线语音输入 & 对话'),
+            StringStruct('FileVersion', '1.1.0.0'),
+            StringStruct('InternalName', 'AI语音助手'),
+            StringStruct('LegalCopyright', 'Copyright © 2026 zq'),
+            StringStruct('OriginalFilename', 'AI语音助手.exe'),
+            StringStruct('ProductName', 'AI 离线语音助手'),
+            StringStruct('ProductVersion', '1.1.0.0'),
+            StringStruct('Comments',
+                         'SenseVoice ASR + Kokoro TTS + 本地/在线大模型对话')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [0x0804, 1200])])
+  ]
+)

@@ -1,5 +1,7 @@
 # AI 离线语音输入 & 对话
 
+<p align="right"><b>当前版本：v1.1.0</b></p>
+
 
 
 <p align="center">

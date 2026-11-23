@@ -30,6 +30,7 @@
   .status-dot.loading{ background:#e0a800; animation:blink 1s infinite; }
   .status-dot.ready{ background:var(--green); box-shadow:0 0 6px var(--green); }
   .status-dot.error{ background:var(--red); }
+  .app-ver{ margin-top:10px; padding-top:8px; border-top:1px dashed var(--border); font-size:10px; color:var(--muted); opacity:.65; text-align:center; letter-spacing:.3px; }
   @keyframes blink{ 0%,100%{ opacity:1; } 50%{ opacity:.3; } }
   /* 主区 */
   .main{ flex:1; display:flex; flex-direction:column; overflow:hidden; }
@@ -138,6 +139,7 @@
       <div class="status-row"><span class="status-dot" id="dot-asr"></span><span>语音识别</span><span class="status-txt" id="txt-asr">加载中…</span></div>
       <div class="status-row"><span class="status-dot" id="dot-llm"></span><span>对话模型</span><span class="status-txt" id="txt-llm">加载中…</span></div>
       <div class="status-row"><span class="status-dot" id="dot-tts"></span><span>语音合成</span><span class="status-txt" id="txt-tts">加载中…</span></div>
+      <div class="app-ver" id="appVersion">v—</div>
     </div>
   </aside>
 
@@ -895,6 +897,12 @@ async function copyText(t){
     toast("已复制");
   }catch(e){ toast("复制失败"); }
 }
+
+// ---------- 版本信息 ----------
+fetch(`${API}/api/version`)
+  .then(r=>r.ok?r.json():null)
+  .then(d=>{ if(d&&d.version) $("#appVersion").textContent=`v${d.version}`; })
+  .catch(()=>{});
 
 // ---------- 模型加载状态轮询 ----------
 const STATUS_TXT={loading:"加载中…",ready:"就绪",error:"失败"};

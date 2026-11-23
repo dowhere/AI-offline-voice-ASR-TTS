@@ -16,6 +16,7 @@ logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 from paths import APP_DIR
+from version import APP_NAME, __version__
 os.chdir(APP_DIR)
 
 HOST = "127.0.0.1"
@@ -90,7 +91,7 @@ def main():
 
     # 3) 创建原生窗口
     window = webview.create_window(
-        title="AI 离线语音输入 & 对话",
+        title=f"{APP_NAME} v{__version__}",
         url=url,
         width=1200,
         height=800,

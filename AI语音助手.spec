@@ -1,8 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
 PyInstaller 打包配置 — AI 离线语音输入 & 对话
-- onefile 单 exe, windowed 无黑窗
+- onedir 免解压, windowed 无黑窗
 - frontend.html 打包进内部
+- version_info.txt 写入 Windows 文件版本属性
 - models/ 不打包 (447MB), 运行时从 exe 同级目录读取
 构建: pyinstaller AI语音助手.spec --noconfirm
 """
@@ -31,7 +32,7 @@ hiddenimports += collect_submodules("uvicorn")
 hiddenimports += [
     "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on",
-    "asr_engine", "llm_engine", "tts_engine", "db", "server", "paths",
+    "asr_engine", "llm_engine", "tts_engine", "db", "server", "paths", "version",
 ]
 
 
@@ -65,6 +66,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon="app.ico",
+    version="version_info.txt",
 )
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False,
                name="AI语音助手")
